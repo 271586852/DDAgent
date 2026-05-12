@@ -1,7 +1,14 @@
-import "dotenv/config";
+import dotenv from "dotenv";
 import Anthropic from "@anthropic-ai/sdk";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import fs from "node:fs/promises";
+import path from "node:path";
+
+dotenv.config({
+  path: ".env",
+  override: true,
+});
 
 const execFileAsync = promisify(execFile);
 
@@ -10,6 +17,8 @@ const client = new Anthropic({
 });
 
 const MODEL = process.env.CLAUDE_MODEL ?? "claude-sonnet-4-6";
+
+const WORKDIR = process.cwd();
 
 const SYSTEM = `
 You are DDAgent, a minimal coding agent.
@@ -20,23 +29,88 @@ Do not claim you ran a command unless the tool result confirms it.
 Keep answers concise and practical.
 `.trim();
 
-const TOOLS = [
+const TOOLS: Anthropic.Messages.ToolUnion[] = [
   {
     name: "bash",
     description:
-      "Run a bash command in the current DDAgent project directory and return stdout/stderr.",
+      "Run a shell command in the current DDAgent project directory and return stdout/stderr. On Windows, this uses PowerShell. On macOS/Linux, this uses bash. Use this for commands like pwd, ls, npm run build, or checking project status.",
     input_schema: {
       type: "object",
       properties: {
         command: {
           type: "string",
-          description: "The bash command to run.",
+          description: "The shell command to run.",
         },
       },
       required: ["command"],
     },
   },
-] as const;
+  {
+    name: "read_file",
+    description:
+      "Read a UTF-8 text file from the current DDAgent project directory. Use this instead of shell commands like cat/type when you need to inspect file contents.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description:
+            "Relative path to the file, for example package.json or src/index.ts.",
+        },
+        limit: {
+          type: "number",
+          description:
+            "Optional maximum number of lines to return. Use this for large files.",
+        },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    name: "write_file",
+    description:
+      "Create or overwrite a UTF-8 text file inside the current DDAgent project directory. Use this when the user asks to create a new file or replace a file completely.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description:
+            "Relative path to the file to write, for example README.md or src/test.ts.",
+        },
+        content: {
+          type: "string",
+          description: "The complete file content to write.",
+        },
+      },
+      required: ["path", "content"],
+    },
+  },
+  {
+    name: "edit_file",
+    description:
+      "Edit a UTF-8 text file by replacing an exact old_text string with new_text. Use this for small targeted edits. The old_text must match exactly.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description:
+            "Relative path to the file to edit, for example src/index.ts.",
+        },
+        old_text: {
+          type: "string",
+          description: "The exact text currently in the file.",
+        },
+        new_text: {
+          type: "string",
+          description: "The replacement text.",
+        },
+      },
+      required: ["path", "old_text", "new_text"],
+    },
+  },
+];
 
 type Message = Anthropic.Messages.MessageParam;
 
@@ -77,20 +151,139 @@ async function runBash(command: string): Promise<string> {
   }
 }
 
-async function runTool(block: Anthropic.Messages.ToolUseBlock): Promise<string> {
-  if (block.name === "bash") {
-    const input = block.input as { command?: string };
+function safePath(inputPath: string) {
+  if (!inputPath || typeof inputPath !== "string") {
+    throw new Error("path must be a non-empty string");
+  }
 
+  const fullPath = path.resolve(WORKDIR, inputPath);
+  const relative = path.relative(WORKDIR, fullPath);
+
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error(`Path escapes workspace: ${inputPath}`);
+  }
+
+  return fullPath;
+}
+
+async function runReadFile(input: { path?: string; limit?: number }) {
+  if (!input.path) {
+    throw new Error("missing path");
+  }
+
+  const filePath = safePath(input.path);
+  const text = await fs.readFile(filePath, "utf-8");
+
+  const lines = text.split(/\r?\n/);
+
+  if (input.limit && input.limit > 0 && lines.length > input.limit) {
+    return truncateOutput(
+      lines.slice(0, input.limit).join("\n") +
+        `\n\n[Output truncated to ${input.limit} lines]`,
+      50000
+    );
+  }
+
+  return truncateOutput(text, 50000);
+}
+
+async function runWriteFile(input: { path?: string; content?: string }) {
+  if (!input.path) {
+    throw new Error("missing path");
+  }
+
+  if (typeof input.content !== "string") {
+    throw new Error("missing content");
+  }
+
+  const filePath = safePath(input.path);
+
+  await fs.mkdir(path.dirname(filePath), {
+    recursive: true,
+  });
+
+  await fs.writeFile(filePath, input.content, "utf-8");
+
+  return `File written: ${input.path}`;
+}
+
+async function runEditFile(input: {
+  path?: string;
+  old_text?: string;
+  new_text?: string;
+}) {
+  if (!input.path) {
+    throw new Error("missing path");
+  }
+
+  if (typeof input.old_text !== "string") {
+    throw new Error("missing old_text");
+  }
+
+  if (typeof input.new_text !== "string") {
+    throw new Error("missing new_text");
+  }
+
+  const filePath = safePath(input.path);
+  const text = await fs.readFile(filePath, "utf-8");
+
+  if (!text.includes(input.old_text)) {
+    throw new Error("old_text not found in file");
+  }
+
+  const nextText = text.replace(input.old_text, input.new_text);
+
+  await fs.writeFile(filePath, nextText, "utf-8");
+
+  return `File edited: ${input.path}`;
+}
+
+const TOOL_HANDLERS: Record<string, (input: any) => Promise<string>> = {
+  bash: async (input: { command?: string }) => {
     if (!input.command) {
-      return "Tool error: missing command";
+      throw new Error("missing command");
     }
 
     console.log(`\n[tool:bash] ${input.command}`);
 
     return await runBash(input.command);
-  }
+  },
 
-  return `Tool error: unknown tool "${block.name}"`;
+  read_file: async (input: { path?: string; limit?: number }) => {
+    console.log(`\n[tool:read_file] ${input.path}`);
+
+    return await runReadFile(input);
+  },
+
+  write_file: async (input: { path?: string; content?: string }) => {
+    console.log(`\n[tool:write_file] ${input.path}`);
+
+    return await runWriteFile(input);
+  },
+
+  edit_file: async (input: {
+    path?: string;
+    old_text?: string;
+    new_text?: string;
+  }) => {
+    console.log(`\n[tool:edit_file] ${input.path}`);
+
+    return await runEditFile(input);
+  },
+};
+
+async function runTool(block: Anthropic.Messages.ToolUseBlock): Promise<string> {
+  try {
+    const handler = TOOL_HANDLERS[block.name];
+
+    if (!handler) {
+      return `Tool error: unknown tool "${block.name}"`;
+    }
+
+    return await handler(block.input);
+  } catch (error) {
+    return `Tool error: ${error instanceof Error ? error.message : String(error)}`;
+  }
 }
 
 function getFinalText(content: Anthropic.Messages.ContentBlock[]) {
