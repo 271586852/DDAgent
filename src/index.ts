@@ -119,6 +119,84 @@ type LoopState = {
   turnCount: number;
 };
 
+type TodoStatus = "pending" | "in_progress" | "completed";
+
+type TodoItem = {
+  content: string;
+  status: TodoStatus;
+  activeForm?: string;
+};
+
+class TodoManager {
+  private items: TodoItem[] = [];
+  public roundsSinceUpdate = 0;
+
+  update(items: TodoItem[]) {
+    const validated: TodoItem[] = [];
+    let inProgressCount = 0;
+
+    for (const item of items) {
+      if (!item.content || typeof item.content !== "string") {
+        throw new Error("Each todo item must have a content string.");
+      }
+
+      const status = item.status ?? "pending";
+
+      if (!["pending", "in_progress", "completed"].includes(status)) {
+        throw new Error(`Invalid todo status: ${status}`);
+      }
+
+      if (status === "in_progress") {
+        inProgressCount += 1;
+      }
+
+      validated.push({
+        content: item.content,
+        status,
+        activeForm: item.activeForm ?? "",
+      });
+    }
+
+    if (inProgressCount > 1) {
+      throw new Error("Only one todo item can be in_progress.");
+    }
+
+    this.items = validated;
+    this.roundsSinceUpdate = 0;
+
+    return this.render();
+  }
+
+  tick() {
+    this.roundsSinceUpdate += 1;
+  }
+
+  shouldRemind() {
+    return this.roundsSinceUpdate >= 3;
+  }
+
+  render() {
+    if (this.items.length === 0) {
+      return "[todo list is empty]";
+    }
+
+    return this.items
+      .map((item) => {
+        const marker =
+          item.status === "completed"
+            ? "[x]"
+            : item.status === "in_progress"
+              ? "[>]"
+              : "[ ]";
+
+        return `${marker} ${item.content}`;
+      })
+      .join("\n");
+  }
+}
+
+const TODO = new TodoManager();
+
 function truncateOutput(text: string, maxLength = 8000) {
   if (text.length <= maxLength) {
     return text;
